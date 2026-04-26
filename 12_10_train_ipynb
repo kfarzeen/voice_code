@@ -1,0 +1,226 @@
+# ======================================================
+# DIALECT CLASSIFICATION - COLAB OPTIMIZED (5 FEATURES)
+# ======================================================
+
+# ============================
+# INSTALL DEPENDENCIES
+# ============================
+!pip install -q noisereduce librosa tensorflow scikit-learn pydub seaborn
+
+# ============================
+# IMPORTS
+# ============================
+import os
+import numpy as np
+from pydub import AudioSegment
+import librosa
+import noisereduce as nr
+import pickle
+import warnings
+warnings.filterwarnings("ignore", message="n_fft.*")
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import confusion_matrix, classification_report
+
+import tensorflow as tf
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import (
+    Input, Conv2D, MaxPooling2D, Dense, Dropout,
+    BatchNormalization, LSTM, Bidirectional, Reshape
+)
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.optimizers import Adam
+
+# ============================
+# MIXED PRECISION
+# ============================
+from tensorflow.keras import mixed_precision
+mixed_precision.set_global_policy('mixed_float16')
+print("Mixed precision policy:", mixed_precision.global_policy())
+
+# ============================
+# CONFIG
+# ============================
+DATASET_PATH = "/content/drive/MyDrive/Voice_code/data"
+MODEL_PATH   = "/content/drive/MyDrive/Voice_code/dialect_model_5feat.h5"
+ENCODER_PATH = "/content/drive/MyDrive/Voice_code/label_encoder_5feat.pkl"
+CACHE_PATH   = "/content/drive/MyDrive/Voice_code/features_cache_5feat.npz"
+
+MAX_PAD_LEN = 200       # reduced from 400 for Colab memory
+AUDIO_EXTENSIONS = (".mp4a", ".m4a", ".wav", ".mp3")
+
+# ============================
+# FEATURE EXTRACTION
+# ============================
+def is_valid_audio_buffer(arr):
+    return isinstance(arr, np.ndarray) and arr.ndim > 0 and arr.dtype.kind in ('f',) and np.all(np.isfinite(arr))
+
+def extract_features_from_array(samples, sr, max_pad_len=MAX_PAD_LEN):
+    try:
+        if len(samples) < 512:
+            samples = np.pad(samples, (0, 512 - len(samples)), mode='constant')
+        samples = np.nan_to_num(samples, nan=0.0, posinf=0.0, neginf=0.0)
+        if not is_valid_audio_buffer(samples):
+            return None
+
+        # Noise reduction
+        noise_len = max(1, int(0.5 * sr))
+        reduced = nr.reduce_noise(y=samples, y_noise=samples[:noise_len], sr=sr)
+
+        # ===== Extract features =====
+        # 1. MFCC
+        mfccs = librosa.feature.mfcc(y=reduced, sr=sr, n_mfcc=40)
+        mfccs = np.pad(mfccs, ((0,0),(0,max(0,max_pad_len - mfccs.shape[1]))), mode='constant')[:, :max_pad_len]
+
+        # 2. Chroma
+        stft = np.abs(librosa.stft(reduced, n_fft=min(512, len(reduced))))
+        chroma = librosa.feature.chroma_stft(S=stft, sr=sr)
+        chroma = np.pad(chroma, ((0,0),(0,max(0,max_pad_len - chroma.shape[1]))), mode='constant')[:, :max_pad_len]
+
+        # 3. Mel
+        mel = librosa.feature.melspectrogram(y=reduced, sr=sr)
+        mel_db = librosa.power_to_db(mel, ref=np.max)
+        mel_db = np.pad(mel_db, ((0,0),(0,max(0,max_pad_len - mel_db.shape[1]))), mode='constant')[:, :max_pad_len]
+
+        # 4. Spectral Contrast
+        contrast = librosa.feature.spectral_contrast(S=stft, sr=sr)
+        contrast = np.pad(contrast, ((0,0),(0,max(0,max_pad_len - contrast.shape[1]))), mode='constant')[:, :max_pad_len]
+
+        # 5. Tonnetz
+        tonnetz = librosa.feature.tonnetz(y=librosa.effects.harmonic(reduced), sr=sr)
+        tonnetz = np.pad(tonnetz, ((0,0),(0,max(0,max_pad_len - tonnetz.shape[1]))), mode='constant')[:, :max_pad_len]
+
+        features = np.vstack([mfccs, chroma, mel_db, contrast, tonnetz])
+        return features.astype(np.float16)
+    except:
+        return None
+
+def extract_features(file_path):
+    try:
+        audio = AudioSegment.from_file(file_path)
+        samples = np.array(audio.get_array_of_samples()).astype(np.float32)
+        samples = samples / max(1e-6, np.max(np.abs(samples)))
+        return extract_features_from_array(samples, audio.frame_rate)
+    except:
+        return None
+
+# ============================
+# PRECOMPUTE FEATURES
+# ============================
+if not os.path.exists(CACHE_PATH):
+    print("Precomputing 5-feature dataset ...")
+    features, labels = [], []
+    for dialect in os.listdir(DATASET_PATH):
+        dpath = os.path.join(DATASET_PATH, dialect)
+        if not os.path.isdir(dpath): continue
+        for fn in os.listdir(dpath):
+            if fn.lower().endswith(AUDIO_EXTENSIONS):
+                feat = extract_features(os.path.join(dpath, fn))
+                if feat is not None:
+                    features.append(feat)
+                    labels.append(dialect)
+    features = np.array(features, dtype=np.float16)
+    labels = np.array(labels)
+    np.savez(CACHE_PATH, features=features, labels=labels)
+    print("Features cached:", features.shape)
+else:
+    print("Loading cached features ...")
+    data = np.load(CACHE_PATH)
+    features = data['features']
+    labels = data['labels']
+    print("Loaded features:", features.shape)
+
+# ============================
+# ENCODE LABELS
+# ============================
+le = LabelEncoder()
+y = le.fit_transform(labels)
+y = to_categorical(y)
+with open(ENCODER_PATH, "wb") as f:
+    pickle.dump(le, f)
+
+# ============================
+# TRAIN/VAL SPLIT
+# ============================
+X_train, X_val, y_train, y_val = train_test_split(
+    features[..., np.newaxis], y, test_size=0.2, random_state=42, stratify=y
+)
+print("Shapes — X_train:", X_train.shape, "X_val:", X_val.shape)
+
+# ============================
+# BUILD MODEL (CNN + BiLSTM)
+# ============================
+model = Sequential([
+    Input(shape=(X_train.shape[1], X_train.shape[2], 1)),
+    Conv2D(32, (3,3), activation='relu', padding='same'),
+    BatchNormalization(),
+    MaxPooling2D((2,2)),
+    Dropout(0.3),
+
+    Conv2D(64, (3,3), activation='relu', padding='same'),
+    BatchNormalization(),
+    MaxPooling2D((2,2)),
+    Dropout(0.3),
+
+    Reshape((64, -1)),
+    Bidirectional(LSTM(64, return_sequences=False)),
+    Dropout(0.3),
+
+    Dense(128, activation='relu'),
+    Dropout(0.3),
+
+    Dense(y.shape[1], activation='softmax', dtype='float32')
+])
+
+model.compile(optimizer=Adam(1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
+model.summary()
+
+# ============================
+# CALLBACKS
+# ============================
+callbacks = [
+    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+    ModelCheckpoint(MODEL_PATH, monitor='val_accuracy', save_best_only=True)
+]
+
+# ============================
+# TRAINING
+# ============================
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    batch_size=16,
+    epochs=100,
+    callbacks=callbacks,
+    verbose=1
+)
+
+model.save(MODEL_PATH)
+print("Training done. Model saved at:", MODEL_PATH)
+
+# ============================
+# EVALUATION
+# ============================
+val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+print(f"\nValidation Accuracy: {val_acc*100:.2f}%")
+
+y_pred = model.predict(X_val)
+y_pred_cls = np.argmax(y_pred, axis=1)
+y_true_cls = np.argmax(y_val, axis=1)
+
+cm = confusion_matrix(y_true_cls, y_pred_cls)
+plt.figure(figsize=(10,8))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+            xticklabels=le.classes_, yticklabels=le.classes_)
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.title("Confusion Matrix")
+plt.show()
+
+print("\nClassification Report:\n")
+print(classification_report(y_true_cls, y_pred_cls, target_names=le.classes_))
